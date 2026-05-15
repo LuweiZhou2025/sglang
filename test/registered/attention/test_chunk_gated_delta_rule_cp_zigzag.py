@@ -1,0 +1,597 @@
+# -*- coding: utf-8 -*-
+"""
+Unit tests for chunk_gated_delta_rule CP zigzag correctness.
+
+Verifies that CP zigzag output matches single-GPU reference for both
+fixed-batch and variable-length (cu_seqlens) cases.
+
+Layout: each rank holds two halves (seg0 + seg1) per sequence:
+  - seg0 sits at causal position = rank   (physical [rank*half, (rank+1)*half))
+  - seg1 sits at causal position = 2*cp_size-1-rank
+         (physical [seq_len-(rank+1)*half, seq_len-rank*half))
+"""
+
+import logging
+import multiprocessing as mp
+import os
+import socket
+import unittest
+from typing import List
+
+import torch
+import torch.nn.functional as F
+
+from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, suite="stage-b-test-2-gpu-large")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+GPU_COUNT = int(os.environ.get("GPU_COUNT", "2"))
+
+
+# ---------------------------------------------------------------------------
+# Helpers: zigzag layout (ported from rtp-llm cp/utils.py)
+# ---------------------------------------------------------------------------
+
+
+def zigzag_causal_order(cp_size: int) -> list:
+    """Map all-gather layout to causal order.
+
+    All-gather layout: [rank0_seg0, rank0_seg1, rank1_seg0, rank1_seg1, ...]
+    Causal order (zigzag): rank0_seg0, rank1_seg0, ..., rankN_seg0,
+                           rankN_seg1, ..., rank1_seg1, rank0_seg1
+
+    Returns indices into the all-gather layout that produce causal order.
+    """
+    num_segs = 2 * cp_size
+    order = []
+    for pos in range(num_segs):
+        if pos < cp_size:
+            rank = pos
+            seg = 0
+        else:
+            rank = num_segs - 1 - pos
+            seg = 1
+        order.append(rank * 2 + seg)
+    return order
+
+
+def build_segment_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Build cu_seqlens that treats each sequence's two halves as separate sequences.
+
+    Input cu_seqlens: [0, L0, L0+L1, ...]  (batch+1 entries)
+    Output: [0, L0/2, L0, L0+L1/2, L0+L1, ...]  (2*batch+1 entries)
+    """
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    half_lengths = lengths // 2
+    batch_size = lengths.shape[0]
+    seg_cu = torch.zeros(
+        2 * batch_size + 1, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+    )
+    for b in range(batch_size):
+        seg_cu[2 * b + 1] = seg_cu[2 * b] + half_lengths[b]
+        seg_cu[2 * b + 2] = seg_cu[2 * b + 1] + half_lengths[b]
+    return seg_cu
+
+
+def _zigzag_seg_starts(seq_len: int, cp_size: int, rank: int) -> tuple:
+    """Return (seg0_start, seg1_start, half) physical offsets in the full
+    sequence for this rank's two halves."""
+    half = seq_len // (2 * cp_size)
+    seg0_start = rank * half
+    seg1_start = seq_len - (rank + 1) * half
+    return seg0_start, seg1_start, half
+
+
+def _build_local_from_full(
+    full: torch.Tensor, seq_lengths: List[int], cp_size: int, rank: int
+) -> torch.Tensor:
+    """Slice each sequence's zigzag halves out of `full` (shape [1, T_total, ...])
+    and concat them in [seg0_seq0, seg1_seq0, seg0_seq1, seg1_seq1, ...] order."""
+    parts = []
+    offset = 0
+    for sl in seq_lengths:
+        s0, s1, half = _zigzag_seg_starts(sl, cp_size, rank)
+        parts.append(full[:, offset + s0 : offset + s0 + half])
+        parts.append(full[:, offset + s1 : offset + s1 + half])
+        offset += sl
+    return torch.cat(parts, dim=1).contiguous()
+
+
+def _find_free_port() -> int:
+    """Find a free TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def chunk_fwd_o_ref(q, k, v, h, g=None, scale=None, cu_seqlens=None, chunk_size=64):
+    """Deterministic PyTorch reference for chunk_fwd_o.
+
+    Computes the same formula as the Triton kernel but in fp32 for
+    reproducibility.  This avoids the non-determinism observed in the
+    Triton ``make_block_ptr`` implementation on certain Triton versions.
+    """
+    B, T, Hg, K = q.shape
+    H, V = v.shape[-2], v.shape[-1]
+    BT = min(chunk_size, max(16, 2 ** (T - 1).bit_length()))  # next_power_of_2
+    BT = min(BT, chunk_size)
+    if scale is None:
+        scale = K ** -0.5
+
+    ci = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    NT = len(ci) if ci is not None else (T + BT - 1) // BT
+    o = torch.zeros(B, T, H, V, dtype=torch.float32, device=q.device)
+    repeat = H // Hg
+
+    for idx in range(NT):
+        if ci is not None:
+            i_n = ci[idx, 0].item()
+            i_t = ci[idx, 1].item()
+            bos = cu_seqlens[i_n].item()
+            eos = cu_seqlens[i_n + 1].item()
+        else:
+            i_t = idx
+            bos, eos = 0, T
+        start = bos + i_t * BT
+        end = min(start + BT, eos)
+        CL = end - start
+
+        for b in range(B):
+            q_c = q[b, start:end].float().permute(1, 0, 2)  # [Hg, CL, K]
+            k_c = k[b, start:end].float().permute(1, 0, 2)  # [Hg, CL, K]
+            v_c = v[b, start:end].float().permute(1, 0, 2)  # [H, CL, V]
+            h_c = h[b, idx].float()  # [H, V, K]
+
+            if repeat > 1:
+                q_c = q_c.repeat_interleave(repeat, dim=0)
+                k_c = k_c.repeat_interleave(repeat, dim=0)
+
+            # Inter-chunk: [H, CL, K] @ [H, K, V] -> [H, CL, V]
+            o_inter = torch.bmm(q_c, h_c.transpose(-1, -2))
+
+            # Intra-chunk: [H, CL, CL]
+            A = torch.bmm(q_c, k_c.transpose(-1, -2))
+
+            if g is not None:
+                g_c = g[b, start:end].float().permute(1, 0)  # [H, CL]
+                o_inter = o_inter * torch.exp(g_c).unsqueeze(-1)
+                g_diff = g_c.unsqueeze(1) - g_c.unsqueeze(2)  # [H, CL, CL]
+                A = A * torch.where(
+                    g_diff <= 0, torch.exp(g_diff), torch.zeros_like(g_diff)
+                )
+
+            mask = torch.tril(torch.ones(CL, CL, device=q.device))
+            A = A * mask.unsqueeze(0)
+            o_c = torch.bmm(A, v_c)
+            o[b, start:end] = ((o_inter + o_c) * scale).permute(1, 0, 2)
+
+    return o.to(q.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Worker: fixed-batch test
+# ---------------------------------------------------------------------------
+
+
+def _worker_fixed_batch(rank, world_size, nccl_port, B, T, H, K, V):
+    import torch.distributed as dist
+
+    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+    from sglang.srt.layers.attention.fla.chunk_fwd import (
+        chunk_gated_delta_rule_fwd_intra,
+    )
+    from sglang.srt.layers.attention.fla.cp.chunk_cp_zigzag import (
+        chunk_gated_delta_rule_fwd_cp_zigzag,
+    )
+    from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(nccl_port)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+        dtype = torch.bfloat16
+
+        torch.manual_seed(42)
+        scale = K**-0.5
+
+        seq_lengths = [T] * B
+        T_total = T * B
+
+        q_full = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
+        k_full = F.normalize(
+            torch.randn(1, T_total, H, K, dtype=torch.float32, device=device),
+            p=2,
+            dim=-1,
+        ).to(dtype)
+        v_full = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
+        g_full = F.logsigmoid(torch.rand(1, T_total, H, dtype=dtype, device=device))
+        beta_full = torch.rand(1, T_total, H, dtype=dtype, device=device).sigmoid()
+        # h0_kv: [N, H, K, V] for CP zigzag internals
+        h0_kv = torch.randn(B, H, K, V, dtype=torch.float32, device=device)
+        # h0_vk: [N, H, V, K] for sglang single-GPU reference
+        h0_vk = h0_kv.transpose(-1, -2).contiguous()
+
+        full_cu = torch.zeros(B + 1, dtype=torch.long, device=device)
+        for i, sl in enumerate(seq_lengths):
+            full_cu[i + 1] = full_cu[i] + sl
+
+        # Build local zigzag inputs for this rank
+        q_l = _build_local_from_full(q_full, seq_lengths, world_size, rank)
+        k_l = _build_local_from_full(k_full, seq_lengths, world_size, rank)
+        v_l = _build_local_from_full(v_full, seq_lengths, world_size, rank)
+        g_l = _build_local_from_full(g_full, seq_lengths, world_size, rank)
+        b_l = _build_local_from_full(beta_full, seq_lengths, world_size, rank)
+
+        T_local = T // world_size
+        local_cu = torch.zeros(B + 1, dtype=torch.long, device=device)
+        for i in range(B):
+            local_cu[i + 1] = local_cu[i] + T_local
+        seg_cu = build_segment_cu_seqlens(local_cu)
+        causal_order = torch.tensor(
+            zigzag_causal_order(world_size),
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Reference: step-by-step single-GPU with deterministic chunk_fwd_o_ref
+        # (the Triton chunk_fwd_o is non-deterministic on some Triton versions)
+        ref_state = h0_vk.clone()
+        initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+        chunk_indices_ref = prepare_chunk_indices(full_cu, 64)
+        g_ref = chunk_local_cumsum(
+            g_full.clone(), chunk_size=64, cu_seqlens=full_cu
+        )
+        w_ref, u_ref, _ = chunk_gated_delta_rule_fwd_intra(
+            k=k_full.clone(),
+            v=v_full.clone(),
+            g=g_ref,
+            beta=beta_full.clone(),
+            cu_seqlens=full_cu,
+            chunk_indices=chunk_indices_ref,
+        )
+        h_ref, vn_ref = chunk_gated_delta_rule_fwd_h(
+            k=k_full.clone(),
+            w=w_ref,
+            u=u_ref,
+            g=g_ref,
+            initial_state=ref_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=full_cu,
+            chunk_indices=chunk_indices_ref,
+        )
+        o_ref = chunk_fwd_o_ref(
+            q=q_full, k=k_full, v=vn_ref, h=h_ref, g=g_ref,
+            scale=scale, cu_seqlens=full_cu,
+        )
+        # ref_state updated in-place → [N, H, V, K]; convert to [N, H, K, V]
+        fs_ref = ref_state.transpose(-1, -2).contiguous()
+
+        # CP zigzag with deterministic fwd_o_fn
+        o_z, _, fs_z = chunk_gated_delta_rule_fwd_cp_zigzag(
+            q=q_l.clone(),
+            k=k_l.clone(),
+            v=v_l.clone(),
+            g=g_l.clone(),
+            beta=b_l.clone(),
+            scale=scale,
+            initial_state=h0_kv.clone(),
+            output_final_state=True,
+            cp_group=dist.group.WORLD,
+            cu_seqlens=local_cu,
+            seg_cu=seg_cu,
+            causal_order=causal_order,
+            fwd_o_fn=chunk_fwd_o_ref,
+        )
+
+        # Compare per-sequence per-segment
+        o_diff = 0.0
+        local_offset = 0
+        full_offset = 0
+        for sl in seq_lengths:
+            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            d0 = (
+                (
+                    o_z[:, local_offset : local_offset + half].float()
+                    - o_ref[:, full_offset + s0 : full_offset + s0 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            d1 = (
+                (
+                    o_z[:, local_offset + half : local_offset + 2 * half].float()
+                    - o_ref[:, full_offset + s1 : full_offset + s1 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            o_diff = max(o_diff, d0, d1)
+            local_offset += 2 * half
+            full_offset += sl
+
+        # final_state check
+        fs_diff = (
+            (fs_z.float() - fs_ref.float()).abs().max().item()
+            if fs_z is not None
+            else 0.0
+        )
+        passed = max(o_diff, fs_diff) < 1e-2
+
+        dist.barrier()
+        logging.info(
+            f"  rank {rank}: o={o_diff:.6f} fs={fs_diff:.6f} "
+            f"{'PASS' if passed else 'FAIL'}"
+        )
+        dist.barrier()
+        torch.cuda.synchronize()
+        dist.destroy_process_group()
+
+        assert passed, f"rank {rank} failed: o={o_diff:.6f} fs={fs_diff:.6f}"
+
+    except Exception as e:
+        print(f"Rank {rank} error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Worker: varlen test
+# ---------------------------------------------------------------------------
+
+
+def _worker_varlen(rank, world_size, nccl_port, seq_lengths, H, K, V):
+    import torch.distributed as dist
+
+    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+    from sglang.srt.layers.attention.fla.chunk_fwd import (
+        chunk_gated_delta_rule_fwd_intra,
+    )
+    from sglang.srt.layers.attention.fla.cp.chunk_cp_zigzag import (
+        chunk_gated_delta_rule_fwd_cp_zigzag,
+    )
+    from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(nccl_port)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+        dtype = torch.bfloat16
+
+        torch.manual_seed(42)
+        N = len(seq_lengths)
+        T_total = sum(seq_lengths)
+        scale = K**-0.5
+
+        q_full = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
+        k_full = F.normalize(
+            torch.randn(1, T_total, H, K, dtype=torch.float32, device=device),
+            p=2,
+            dim=-1,
+        ).to(dtype)
+        v_full = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
+        g_full = F.logsigmoid(torch.rand(1, T_total, H, dtype=dtype, device=device))
+        beta_full = torch.rand(1, T_total, H, dtype=dtype, device=device).sigmoid()
+        h0_kv = torch.randn(N, H, K, V, dtype=torch.float32, device=device)
+        h0_vk = h0_kv.transpose(-1, -2).contiguous()
+
+        full_cu = torch.zeros(N + 1, dtype=torch.long, device=device)
+        for i, sl in enumerate(seq_lengths):
+            full_cu[i + 1] = full_cu[i] + sl
+
+        q_l = _build_local_from_full(q_full, seq_lengths, world_size, rank)
+        k_l = _build_local_from_full(k_full, seq_lengths, world_size, rank)
+        v_l = _build_local_from_full(v_full, seq_lengths, world_size, rank)
+        g_l = _build_local_from_full(g_full, seq_lengths, world_size, rank)
+        b_l = _build_local_from_full(beta_full, seq_lengths, world_size, rank)
+
+        local_lengths = [sl // world_size for sl in seq_lengths]
+        local_cu = torch.zeros(N + 1, dtype=torch.long, device=device)
+        for i, ll in enumerate(local_lengths):
+            local_cu[i + 1] = local_cu[i] + ll
+        seg_cu = build_segment_cu_seqlens(local_cu)
+        causal_order = torch.tensor(
+            zigzag_causal_order(world_size),
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Reference: step-by-step single-GPU with deterministic chunk_fwd_o_ref
+        ref_state = h0_vk.clone()
+        initial_state_indices = torch.arange(N, dtype=torch.int32, device=device)
+        chunk_indices_ref = prepare_chunk_indices(full_cu, 64)
+        g_ref = chunk_local_cumsum(
+            g_full.clone(), chunk_size=64, cu_seqlens=full_cu
+        )
+        w_ref, u_ref, _ = chunk_gated_delta_rule_fwd_intra(
+            k=k_full.clone(),
+            v=v_full.clone(),
+            g=g_ref,
+            beta=beta_full.clone(),
+            cu_seqlens=full_cu,
+            chunk_indices=chunk_indices_ref,
+        )
+        h_ref, vn_ref = chunk_gated_delta_rule_fwd_h(
+            k=k_full.clone(),
+            w=w_ref,
+            u=u_ref,
+            g=g_ref,
+            initial_state=ref_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=full_cu,
+            chunk_indices=chunk_indices_ref,
+        )
+        o_ref = chunk_fwd_o_ref(
+            q=q_full, k=k_full, v=vn_ref, h=h_ref, g=g_ref,
+            scale=scale, cu_seqlens=full_cu,
+        )
+        ref_final_state_kv = ref_state.transpose(-1, -2).contiguous()
+
+        # CP zigzag with deterministic fwd_o_fn
+        o_z, _, fs_z = chunk_gated_delta_rule_fwd_cp_zigzag(
+            q=q_l.clone(),
+            k=k_l.clone(),
+            v=v_l.clone(),
+            g=g_l.clone(),
+            beta=b_l.clone(),
+            scale=scale,
+            initial_state=h0_kv.clone(),
+            output_final_state=True,
+            cp_group=dist.group.WORLD,
+            cu_seqlens=local_cu,
+            seg_cu=seg_cu,
+            causal_order=causal_order,
+            fwd_o_fn=chunk_fwd_o_ref,
+        )
+
+        o_diff = 0.0
+        local_offset = 0
+        full_offset = 0
+        for sl in seq_lengths:
+            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            d0 = (
+                (
+                    o_z[:, local_offset : local_offset + half].float()
+                    - o_ref[:, full_offset + s0 : full_offset + s0 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            d1 = (
+                (
+                    o_z[:, local_offset + half : local_offset + 2 * half].float()
+                    - o_ref[:, full_offset + s1 : full_offset + s1 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            o_diff = max(o_diff, d0, d1)
+            local_offset += 2 * half
+            full_offset += sl
+
+        fs_diff = (
+            (fs_z.float() - ref_final_state_kv.float()).abs().max().item()
+            if fs_z is not None
+            else 0.0
+        )
+        passed = max(o_diff, fs_diff) < 1e-2
+
+        dist.barrier()
+        logging.info(
+            f"  rank {rank}: o={o_diff:.6f} fs={fs_diff:.6f} "
+            f"{'PASS' if passed else 'FAIL'}"
+        )
+        dist.barrier()
+        torch.cuda.synchronize()
+        dist.destroy_process_group()
+
+        assert passed, f"rank {rank} failed: o={o_diff:.6f} fs={fs_diff:.6f}"
+
+    except Exception as e:
+        print(f"Rank {rank} error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.device_count() >= GPU_COUNT,
+    f"Requires >= {GPU_COUNT} GPUs",
+)
+class TestChunkCPZigzag(unittest.TestCase):
+
+    def setUp(self):
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
+    def _run_fixed_batch(self, B, T, H=16, K=128, V=128):
+        nccl_port = _find_free_port()
+        processes = []
+        for rank in range(GPU_COUNT):
+            p = mp.Process(
+                target=_worker_fixed_batch,
+                args=(rank, GPU_COUNT, nccl_port, B, T, H, K, V),
+                name=f"rank-{rank}",
+            )
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join(timeout=120)
+            if p.exitcode != 0:
+                raise RuntimeError(
+                    f"Process {p.name} exited with code {p.exitcode}"
+                )
+
+    def _run_varlen(self, seq_lengths, H=16, K=128, V=128):
+        nccl_port = _find_free_port()
+        processes = []
+        for rank in range(GPU_COUNT):
+            p = mp.Process(
+                target=_worker_varlen,
+                args=(rank, GPU_COUNT, nccl_port, seq_lengths, H, K, V),
+                name=f"rank-{rank}",
+            )
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join(timeout=120)
+            if p.exitcode != 0:
+                raise RuntimeError(
+                    f"Process {p.name} exited with code {p.exitcode}"
+                )
+
+    # --- Fixed batch (single seq per batch) ---
+
+    def test_fixed_batch_256(self):
+        self._run_fixed_batch(B=1, T=256)
+
+    def test_fixed_batch_1024(self):
+        self._run_fixed_batch(B=1, T=1024)
+
+    def test_fixed_batch_8192(self):
+        self._run_fixed_batch(B=1, T=8192)
+
+    def test_fixed_batch_32k(self):
+        self._run_fixed_batch(B=1, T=32768)
+
+    def test_fixed_batch_64k(self):
+        self._run_fixed_batch(B=1, T=65536)
+
+    # --- Varlen ---
+
+    def test_varlen_two_equal(self):
+        self._run_varlen([4096, 4096])
+
+    def test_varlen_two_unequal(self):
+        self._run_varlen([8192, 16384])
+
+    def test_varlen_three(self):
+        self._run_varlen([4096, 8192, 4096])
+
+
+if __name__ == "__main__":
+    unittest.main()
