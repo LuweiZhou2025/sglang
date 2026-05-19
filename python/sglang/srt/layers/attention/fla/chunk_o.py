@@ -28,9 +28,18 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 # )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
+    # Per-chunk readout (cf. gated_delta_net_theory.md, Eq. O):
+    #     O_{[t]} = Q<-_{[t]} S_{[t]}^T  +  ( Q K^T * Gamma_{[t]} ) v_new
+    # where:
+    #   - b_o += Q @ h^T  builds the inter-chunk term  Q S_{[t]}^T ; it is then multiplied
+    #     by exp(b_g) = gamma_i below to turn Q into  Q<- = diag(gamma_i) Q.
+    #   - b_A = Q K^T  is masked causally and multiplied by  exp(b_g_row - b_g_col) = Gamma,
+    #     then dotted with v_new (== DeltaV from the h-recurrence) to give the intra-chunk
+    #     contribution  (Q K^T * Gamma) DeltaV.
+    # The two terms are summed and scaled by 1/sqrt(K).
     q,
     k,
-    v,
+    v,  # this is v_new (= DeltaV) produced by chunk_gated_delta_rule_fwd_h, NOT the raw V.
     h,
     g,
     o,

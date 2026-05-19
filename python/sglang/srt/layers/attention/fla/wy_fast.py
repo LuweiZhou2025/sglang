@@ -21,6 +21,10 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 # )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
+    # Per-chunk projection through A = (I + L)^{-1} (cf. gated_delta_net_theory.md):
+    #     u = A @ diag(beta) V                     ==  U~_{[t]}   (Eq. U~)
+    #     w = A @ diag(beta) diag(gamma_i) K       ==  W<-_{[t]}  (Eq. W, rescaled)
+    # ``g`` here is the per-chunk cumulative log-decay G_i, so b_g = exp(G_i) = gamma_i.
     k,
     v,
     beta,

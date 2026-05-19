@@ -31,6 +31,15 @@ CHUNK_SIZE = 64
 # )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
+    # Chunk-sequential memory recurrence (cf. gated_delta_net_theory.md, Eqs. DV & S-update).
+    # For each chunk t = 0..NT-1 this kernel performs:
+    #     v_new[t] = u[t]  -  w[t] @ b_h^T                       (Eq. DV:   v_new = U~ - W<- S^T)
+    #     b_h     <- gamma_C * b_h  +  K_{[t]}^T @ (exp(G_C - G_i) * v_new[t])
+    #                                                            (Eq. S-update: S_{[t+1]} = gamma_C S_{[t]} + K->^T DeltaV)
+    # b_h is the chunk-start state S_{[t]} carried through the loop (shape [V, K]);
+    # the [V, K] tile is sliced along K into up to 4 blocks of 64 to stay in registers.
+    # `g` is the per-chunk cumulative log-decay G_i;  exp(b_g_last) = gamma_C is the
+    # decay applied to b_h, and exp(b_g_last - b_g) = gamma_C/gamma_i implements K-> on K.
     k,
     v,
     w,

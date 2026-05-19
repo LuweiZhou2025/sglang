@@ -36,11 +36,37 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
 ):
+    r"""Triton forward of the chunk-wise gated delta rule.
+
+    Math reference (cf. gated_delta_net_theory.md, chunk-wise form). Per chunk [t]
+    of length C, with  alpha_t = exp(g_t),  gamma_j = prod_{r<=j} alpha_r,
+    Gamma_{i,j} = gamma_i/gamma_j for j<=i (else 0):
+
+        L          = strictLower( diag(beta) ( Gamma * K K^T ) )                (Eq. L)
+        U~_{[t]}   = (I + L)^{-1} diag(beta) V                                   (Eq. U~)  -> ``u``
+        W<-_{[t]}  = (I + L)^{-1} diag(beta) diag(gamma_i) K                     (Eq. W)   -> ``w``
+        DeltaV     = U~_{[t]} - W<-_{[t]} S_{[t]}^T                              (Eq. DV)  -> ``v_new``
+        S_{[t+1]}  = gamma_C * S_{[t]} + K->_{[t]}^T DeltaV                      (Eq. S)   -> ``h``
+                     where K->_{[t]} = diag(gamma_C / gamma_i) K_{[t]}
+        O_{[t]}    = Q<-_{[t]} S_{[t]}^T + (Q K^T * Gamma_{[t]}) DeltaV          (Eq. O)   -> ``o``
+                     where Q<-_{[t]} = diag(gamma_i) Q_{[t]}
+
+    Kernel pipeline (one stage per equation group):
+      1. chunk_local_cumsum                : G_i = sum_{s<=i} g_s  (so gamma_i = exp(G_i))
+      2. chunk_gated_delta_rule_fwd_intra  :
+            (a) fused kkt+solve_tril       -> A = (I + L)^{-1}                  (Eq. L)
+            (b) recompute_w_u              -> w = W<- (Eq. W),  u = U~ (Eq. U~)
+      3. chunk_gated_delta_rule_fwd_h      : sequential pass over chunks producing
+            v_new = DeltaV (Eq. DV)  and  h[t] = S_{[t]} (Eq. S-update)
+      4. chunk_fwd_o                       : O_{[t]} = Q<- S^T + (QK^T * Gamma) v_new  (Eq. O)
+    """
+    # Step 1 (gamma factors): turn per-step log-decays into per-chunk cumulative G_i.
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
 
-    # fused kkt + solve_tril + recompute_w_u
+    # Step 2 (Eqs. L, U~, W): fused kkt + solve_tril + recompute_w_u.
+    #   A = (I + L)^{-1},  u = U~_{[t]},  w = W<-_{[t]}.
     w, u, A = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
@@ -50,6 +76,10 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
+    # Step 3 (Eqs. DV, S-update): chunk-sequential memory recurrence.
+    #   v_new[t] = u[t] - w[t] @ S_{[t]}^T                       ==  DeltaV  (Eq. DV)
+    #   S_{[t+1]} = gamma_C * S_{[t]} + K->_{[t]}^T v_new[t]                 (Eq. S-update)
+    # h stores S_{[t]} for every chunk t (consumed by chunk_fwd_o below).
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -60,6 +90,9 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+    # Step 4 (Eq. O): per-chunk readout combining inter-chunk (Q<- S^T) and intra-chunk
+    # ((Q K^T * Gamma) v_new) contributions. Inside the kernel, exp(b_g) implements the
+    # diag(gamma_i) factor that turns Q into Q<- for the inter-chunk term.
     o = chunk_fwd_o(
         q=q,
         k=k,

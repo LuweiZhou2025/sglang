@@ -55,17 +55,27 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     IS_VARLEN: tl.constexpr,
 ):
     """
-    Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
+    Fused kernel: build A = strictLower( diag(beta) (Gamma * K K^T) )  (the matrix L in
+    gated_delta_net_theory.md, Eq. L) and immediately solve  (I + A)^{-1}  in one pass.
 
-    This kernel fuses chunk_scaled_dot_kkt_fwd and solve_tril into a single kernel,
-    avoiding the HBM round-trip for the intermediate A matrix.
+    Inside one chunk of length BT (split into 4 sub-chunks of BC each), this kernel
+    fuses what was previously two separate kernels (`chunk_scaled_dot_kkt_fwd` +
+    `solve_tril`), avoiding the HBM round-trip for the intermediate A.
+
+    Math correspondence (per chunk):
+        A_{i,j}      = beta_i * (k_i . k_j) * exp(G_i - G_j)   for j < i  else 0
+                     ==  strictLower( diag(beta) ( Gamma * K K^T ) )   (Eq. L)
+        output A     = (I + A)^{-1}                                    (used by Eqs. U~, W)
 
     Steps:
-    1. Compute all 10 lower-triangular [BC, BC] blocks of beta * K @ K^T in registers
-    2. Apply gate and beta scaling
-    3. Forward substitution on diagonal blocks
-    4. Block merge to get full (I+A)^{-1}
-    5. Write result to A (output)
+    1. Compute all 10 lower-triangular [BC, BC] blocks of K @ K^T in registers.
+    2. Apply  exp(G_i - G_j)  (= gamma_i/gamma_j, i.e. Gamma) and the beta_i row-scale.
+    3. Forward substitution on each diagonal block -> per-block (I + A_diag)^{-1}.
+       Same algorithm as the PyTorch reference's inner loop; see
+       transformers .../modeling_qwen3_5_moe.py::torch_chunk_gated_delta_rule.
+    4. Block-merge the 4 diagonal inverses with the 6 off-diagonal A blocks to obtain
+       the full lower-triangular  (I + A)^{-1}  on the [BT, BT] chunk.
+    5. Store the full [BT, BT] inverse into A.
     """
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -348,10 +358,16 @@ def chunk_gated_delta_rule_fwd_intra(
     r"""
     GDN intra-chunk forward: fused kkt + solve_tril + recompute_w_u.
 
+    Computes the chunk-local quantities from gated_delta_net_theory.md:
+        A  = (I + L)^{-1}  where  L = strictLower( diag(beta) (Gamma * K K^T) )   (Eq. L)
+        u  = U~_{[t]}      = A @ diag(beta) V                                      (Eq. U~)
+        w  = W<-_{[t]}     = A @ diag(beta) diag(gamma_i) K                        (Eq. W, rescaled form)
+    (gamma_i = exp(G_i), G_i = cumulative log-decay inside the chunk.)
+
     Equivalent to:
-        A = chunk_scaled_dot_kkt_fwd(k, g, beta, ...)       # kernel 1
-        A = solve_tril(A, ...)                                # kernel 2
-        w, u = recompute_w_u_fwd(k, v, beta, A, g, ...)      # kernel 3
+        A = chunk_scaled_dot_kkt_fwd(k, g, beta, ...)        # kernel 1  (build L)
+        A = solve_tril(A, ...)                                # kernel 2  (invert I+L)
+        w, u = recompute_w_u_fwd(k, v, beta, A, g, ...)       # kernel 3  (W<-, U~)
 
     Fuses kernels 1+2 into a single kernel, reducing from 3 to 2 kernel launches
     and eliminating the HBM round-trip for the intermediate A matrix.

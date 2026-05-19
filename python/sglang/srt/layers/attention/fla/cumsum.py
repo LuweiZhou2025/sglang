@@ -259,6 +259,18 @@ def chunk_local_cumsum(
     chunk_indices: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    r"""Per-chunk cumulative sum of the per-step log-decay g.
+
+    For each chunk [t] of length C, returns  G_i = sum_{s<=i} g_{tC+s}  for i = 0..C-1
+    (chunks are independent; no cross-chunk accumulation). With  alpha_t = exp(g_t),
+    this gives  gamma_i = exp(G_i) = prod_{s<=i} alpha_{tC+s}  used throughout the
+    chunk-wise gated delta rule (cf. gated_delta_net_theory.md):
+
+        Gamma_{i,j}     = gamma_i / gamma_j = exp(G_i - G_j),  j<=i
+        gamma_C         = exp(G_C)                  (full-chunk decay applied to S)
+        gamma_C/gamma_i = exp(G_C - G_i)            (decay used to build K->)
+        diag(gamma_i)   = exp(G_i)                  (used to build Q<- and W<-)
+    """
     if cu_seqlens is not None:
         assert (
             g.shape[0] == 1
