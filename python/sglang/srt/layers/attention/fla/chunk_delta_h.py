@@ -130,6 +130,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
+        # store S_{[t]} <- b_h, state shape is [B,H,T/trunk_sz, DK, DV]. All trunk would has its own copy of S_{[t]} to compute Ot in parallel between trunks.
         p_h1 = tl.make_block_ptr(
             h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
         )
@@ -153,6 +154,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
         )
+
+        # load W<- per trunk,   W<- @ S_{[t]} per trunk
         b_w = tl.load(p_w, boundary_check=(0, 1))
         b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
         if K > 64:
@@ -176,6 +179,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         p_v = tl.make_block_ptr(
             v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
         )
+
+        # ΔV = U~ - W<- @ S_{[t]}, per trunk
         b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
 
         if SAVE_NEW_VALUE:
@@ -185,14 +190,18 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
 
         last_idx = min((i_t + 1) * BT, T) - 1
+
         if USE_G:
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
             p_g = tl.make_block_ptr(
                 g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
             )
             b_g = tl.load(p_g, boundary_check=(0,))
+            # Oy = (Q@K^T * Gamma)@ ΔV, 把Gamma吸收进ΔV, bv 是 ΔV?
             b_v = b_v * safe_exp(b_g_last - b_g)[:, None]
             b_g_last = exp(b_g_last)
+
+            # S->{[t]} = gamma_C * S{[t]}
             b_h1 = b_h1 * b_g_last
             if K > 64:
                 b_h2 = b_h2 * b_g_last
@@ -201,6 +210,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 192:
                 b_h4 = b_h4 * b_g_last
 
+        # None
         if USE_GK:
             o_k1 = tl.arange(0, 64)
             b_gk_last1 = tl.load(
@@ -239,6 +249,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
+
+        # S_{[t+1]}   = S->_{[t]}  +  K->^T @ΔV  , K->^T = Gamma *K_{[t]} , Gamma already be absorbed into ΔV when USE_G is True, so we can directly use K_{[t]} here?
         b_h1 += tl.trans(tl.dot(b_k, b_v))
         if K > 64:
             p_k = tl.make_block_ptr(
@@ -260,6 +272,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
+    # update the final state B,H, DK, DV].
     if INPLACE_UPDATE:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))

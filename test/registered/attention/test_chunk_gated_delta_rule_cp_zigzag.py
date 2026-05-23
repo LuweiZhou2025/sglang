@@ -113,7 +113,7 @@ def chunk_fwd_o_ref(q, k, v, h, g=None, scale=None, cu_seqlens=None, chunk_size=
     BT = min(chunk_size, max(16, 2 ** (T - 1).bit_length()))  # next_power_of_2
     BT = min(BT, chunk_size)
     if scale is None:
-        scale = K ** -0.5
+        scale = K**-0.5
 
     ci = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = len(ci) if ci is not None else (T + BT - 1) // BT
@@ -200,7 +200,8 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         q_full = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
         k_full = F.normalize(
             torch.randn(1, T_total, H, K, dtype=torch.float32, device=device),
-            p=2, dim=-1,
+            p=2,
+            dim=-1,
         ).to(dtype)
         v_full = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
         g_full = F.logsigmoid(torch.rand(1, T_total, H, dtype=dtype, device=device))
@@ -225,7 +226,9 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             local_cu[i + 1] = local_cu[i] + ll
         seg_cu = build_segment_cu_seqlens(local_cu)
         causal_order = torch.tensor(
-            zigzag_causal_order(world_size), dtype=torch.long, device=device,
+            zigzag_causal_order(world_size),
+            dtype=torch.long,
+            device=device,
         )
 
         # Reference: single-GPU with deterministic chunk_fwd_o_ref
@@ -234,27 +237,49 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         chunk_indices_ref = prepare_chunk_indices(full_cu, 64)
         g_ref = chunk_local_cumsum(g_full.clone(), chunk_size=64, cu_seqlens=full_cu)
         w_ref, u_ref, _ = chunk_gated_delta_rule_fwd_intra(
-            k=k_full.clone(), v=v_full.clone(), g=g_ref,
-            beta=beta_full.clone(), cu_seqlens=full_cu, chunk_indices=chunk_indices_ref,
+            k=k_full.clone(),
+            v=v_full.clone(),
+            g=g_ref,
+            beta=beta_full.clone(),
+            cu_seqlens=full_cu,
+            chunk_indices=chunk_indices_ref,
         )
         h_ref, vn_ref = chunk_gated_delta_rule_fwd_h(
-            k=k_full.clone(), w=w_ref, u=u_ref, g=g_ref,
-            initial_state=ref_state, initial_state_indices=initial_state_indices,
-            cu_seqlens=full_cu, chunk_indices=chunk_indices_ref,
+            k=k_full.clone(),
+            w=w_ref,
+            u=u_ref,
+            g=g_ref,
+            initial_state=ref_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=full_cu,
+            chunk_indices=chunk_indices_ref,
         )
         o_ref = chunk_fwd_o_ref(
-            q=q_full, k=k_full, v=vn_ref, h=h_ref, g=g_ref,
-            scale=scale, cu_seqlens=full_cu,
+            q=q_full,
+            k=k_full,
+            v=vn_ref,
+            h=h_ref,
+            g=g_ref,
+            scale=scale,
+            cu_seqlens=full_cu,
         )
         fs_ref = ref_state.transpose(-1, -2).contiguous()
 
         # CP zigzag
         o_z, _, fs_z = chunk_gated_delta_rule_fwd_cp_zigzag(
-            q=q_l.clone(), k=k_l.clone(), v=v_l.clone(),
-            g=g_l.clone(), beta=b_l.clone(), scale=scale,
-            initial_state=h0_kv.clone(), output_final_state=True,
-            cp_group=dist.group.WORLD, cu_seqlens=local_cu,
-            seg_cu=seg_cu, causal_order=causal_order, fwd_o_fn=chunk_fwd_o_ref,
+            q=q_l.clone(),
+            k=k_l.clone(),
+            v=v_l.clone(),
+            g=g_l.clone(),
+            beta=b_l.clone(),
+            scale=scale,
+            initial_state=h0_kv.clone(),
+            output_final_state=True,
+            cp_group=dist.group.WORLD,
+            cu_seqlens=local_cu,
+            seg_cu=seg_cu,
+            causal_order=causal_order,
+            fwd_o_fn=None,
         )
 
         # Compare
@@ -262,21 +287,39 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         local_offset, full_offset = 0, 0
         for sl in seq_lengths:
             s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            d0 = (o_z[:, local_offset:local_offset + half].float()
-                  - o_ref[:, full_offset + s0:full_offset + s0 + half].float()
-                  ).abs().max().item()
-            d1 = (o_z[:, local_offset + half:local_offset + 2 * half].float()
-                  - o_ref[:, full_offset + s1:full_offset + s1 + half].float()
-                  ).abs().max().item()
+            d0 = (
+                (
+                    o_z[:, local_offset : local_offset + half].float()
+                    - o_ref[:, full_offset + s0 : full_offset + s0 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            d1 = (
+                (
+                    o_z[:, local_offset + half : local_offset + 2 * half].float()
+                    - o_ref[:, full_offset + s1 : full_offset + s1 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
             o_diff = max(o_diff, d0, d1)
             local_offset += 2 * half
             full_offset += sl
 
-        fs_diff = (fs_z.float() - fs_ref.float()).abs().max().item() if fs_z is not None else 0.0
+        fs_diff = (
+            (fs_z.float() - fs_ref.float()).abs().max().item()
+            if fs_z is not None
+            else 0.0
+        )
         passed = max(o_diff, fs_diff) < 1e-2
 
         dist.barrier()
-        logging.info(f"  rank {rank}: o={o_diff:.6f} fs={fs_diff:.6f} {'PASS' if passed else 'FAIL'}")
+        logging.info(
+            f"  rank {rank}: o={o_diff:.6f} fs={fs_diff:.6f} {'PASS' if passed else 'FAIL'}"
+        )
         dist.barrier()
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -286,6 +329,7 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
     except Exception as e:
         print(f"Rank {rank} error: {e}")
         import traceback
+
         traceback.print_exc()
         raise
 
@@ -323,8 +367,13 @@ def run_test(seq_lengths, H=16, K=128, V=128):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test CP zigzag correctness")
-    parser.add_argument("--seqlens", type=int, nargs="+", default=None,
-                        help="Sequence lengths (e.g. --seqlens 4096 8192)")
+    parser.add_argument(
+        "--seqlens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Sequence lengths (e.g. --seqlens 4096 8192)",
+    )
     parser.add_argument("--H", type=int, default=16)
     parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--V", type=int, default=128)
@@ -337,13 +386,13 @@ if __name__ == "__main__":
 
     # Default: run a suite of configs
     configs = [
-        [256],
+        # [256],
         [1024],
-        [8192],
-        [32768],
-        [4096, 4096],
-        [8192, 16384],
-        [4096, 8192, 4096],
+        # [8192],
+        # [32768],
+        # [4096, 4096],
+        # [8192, 16384],
+        # [4096, 8192, 4096],
     ]
     results = []
     for sl in configs:

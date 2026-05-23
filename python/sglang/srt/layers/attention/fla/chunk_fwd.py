@@ -109,6 +109,14 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     m_tc3 = (i_tc3 + o_i) < T
 
     # load beta for each sub-chunk
+    # tl.make_block_ptr(
+    # beta + bos * H + i_h,  # 基地址：指向当前 batch、当前 head 的 beta 起点
+    # (T,),                   # shape：逻辑上这是一个长度为 T 的 1D 数组
+    # (H,),                   # stride：相邻 time step 之间间隔 H 个元素
+    # (i_tc0,),               # offset：从第 i_tc0 个位置开始取
+    # (BC,),                  # block_shape：取 BC=16 个元素
+    # (0,),                   # order：维度排列顺序（1D 只有 0）
+    # )
     p_b0 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_tc0,), (BC,), (0,))
     p_b1 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_tc1,), (BC,), (0,))
     p_b2 = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_tc2,), (BC,), (0,))
