@@ -19,6 +19,20 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
+import torch.distributed as dist
+
+from sglang.srt.layers.attention.fla.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+)
+from sglang.srt.layers.attention.fla.chunk_fwd import (
+    chunk_gated_delta_rule_fwd_intra,
+)
+from sglang.srt.layers.attention.fla.cp.chunk_cp_zigzag import (
+    chunk_gated_delta_rule_fwd_cp_zigzag,
+)
+from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+
+from sglang.srt.layers.attention.fla.chunk_o import chunk_fwd_o
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -152,7 +166,9 @@ def chunk_fwd_o_ref(q, k, v, h, g=None, scale=None, cu_seqlens=None, chunk_size=
             if g is not None:
                 g_c = g[b, start:end].float().permute(1, 0)  # [H, CL]
                 o_inter = o_inter * torch.exp(g_c).unsqueeze(-1)
-                g_diff = g_c.unsqueeze(1) - g_c.unsqueeze(2)  # [H, CL, CL]
+                # g_diff[h, i, j] = g_c[h, i] - g_c[h, j]; for causal (i>=j)
+                # with decreasing cumsum this is <=0 → exp gives the decay.
+                g_diff = g_c.unsqueeze(2) - g_c.unsqueeze(1)  # [H, CL, CL]
                 A = A * torch.where(
                     g_diff <= 0, torch.exp(g_diff), torch.zeros_like(g_diff)
                 )
@@ -171,19 +187,6 @@ def chunk_fwd_o_ref(q, k, v, h, g=None, scale=None, cu_seqlens=None, chunk_size=
 
 
 def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
-    import torch.distributed as dist
-
-    from sglang.srt.layers.attention.fla.chunk_delta_h import (
-        chunk_gated_delta_rule_fwd_h,
-    )
-    from sglang.srt.layers.attention.fla.chunk_fwd import (
-        chunk_gated_delta_rule_fwd_intra,
-    )
-    from sglang.srt.layers.attention.fla.cp.chunk_cp_zigzag import (
-        chunk_gated_delta_rule_fwd_cp_zigzag,
-    )
-    from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(nccl_port)
@@ -192,7 +195,7 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         device = torch.device(f"cuda:{rank}")
         dtype = torch.bfloat16
 
-        torch.manual_seed(42)
+        torch.manual_seed(0)
         N = len(seq_lengths)
         T_total = sum(seq_lengths)
         scale = K**-0.5
@@ -254,32 +257,130 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             cu_seqlens=full_cu,
             chunk_indices=chunk_indices_ref,
         )
-        o_ref = chunk_fwd_o_ref(
-            q=q_full,
-            k=k_full,
-            v=vn_ref,
-            h=h_ref,
-            g=g_ref,
-            scale=scale,
-            cu_seqlens=full_cu,
-        )
+
+        use_ref = 0
+        if use_ref:
+            o_ref = chunk_fwd_o_ref(
+                q=q_full,
+                k=k_full,
+                v=vn_ref,
+                h=h_ref,
+                g=g_ref,
+                scale=scale,
+                cu_seqlens=full_cu,
+            )
+        else:
+            o_ref = chunk_fwd_o(
+                q=q_full,
+                k=k_full,
+                v=vn_ref,
+                h=h_ref,
+                g=g_ref,
+                scale=scale,
+                cu_seqlens=full_cu,
+            )
         fs_ref = ref_state.transpose(-1, -2).contiguous()
 
         # CP zigzag
-        o_z, _, fs_z = chunk_gated_delta_rule_fwd_cp_zigzag(
-            q=q_l.clone(),
-            k=k_l.clone(),
-            v=v_l.clone(),
-            g=g_l.clone(),
-            beta=b_l.clone(),
-            scale=scale,
-            initial_state=h0_kv.clone(),
-            output_final_state=True,
-            cp_group=dist.group.WORLD,
-            cu_seqlens=local_cu,
-            seg_cu=seg_cu,
-            causal_order=causal_order,
-            fwd_o_fn=None,
+        if use_ref:
+            o_z, h_all, fs_z, v_z = chunk_gated_delta_rule_fwd_cp_zigzag(
+                q=q_l.clone(),
+                k=k_l.clone(),
+                v=v_l.clone(),
+                g=g_l.clone(),
+                beta=b_l.clone(),
+                scale=scale,
+                initial_state=h0_kv.clone(),
+                output_final_state=True,
+                cp_group=dist.group.WORLD,
+                cu_seqlens=local_cu,
+                seg_cu=seg_cu,
+                causal_order=causal_order,
+                fwd_o_fn=chunk_fwd_o_ref,
+            )
+        else:
+            o_z, h_all, fs_z, v_z = chunk_gated_delta_rule_fwd_cp_zigzag(
+                q=q_l.clone(),
+                k=k_l.clone(),
+                v=v_l.clone(),
+                g=g_l.clone(),
+                beta=b_l.clone(),
+                scale=scale,
+                initial_state=h0_kv.clone(),
+                output_final_state=True,
+                cp_group=dist.group.WORLD,
+                cu_seqlens=local_cu,
+                seg_cu=seg_cu,
+                causal_order=causal_order,
+                fwd_o_fn=chunk_fwd_o,
+            )
+
+        # Debug: compare h_all per chunk
+        # CP h_all has shape [1, 2*N_seq * NT_per_seg, H, V, K]
+        # For N=1, seg0 takes first NT_per_seg chunks of h_all, seg1 takes next NT_per_seg
+        NT_seg = h_all.shape[1] // 2
+        NT_chunk = 64
+        # seg0 of rank corresponds to full chunks at full positions [s0, s0+half)
+        # i.e., ref chunk indices [s0//64, (s0+half)//64)
+        h_state_diff = 0.0
+        for sl in seq_lengths:
+            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            ref_seg0_start = s0 // NT_chunk
+            ref_seg1_start = s1 // NT_chunk
+            diff_h0 = (
+                (
+                    h_all[0, :NT_seg].float()
+                    - h_ref[0, ref_seg0_start : ref_seg0_start + NT_seg].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            diff_h1 = (
+                (
+                    h_all[0, NT_seg:].float()
+                    - h_ref[0, ref_seg1_start : ref_seg1_start + NT_seg].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            # print(f"  rank{rank} h_diff seg0={diff_h0:.6f} seg1={diff_h1:.6f}")
+            h_state_diff = max(h_state_diff, diff_h0, diff_h1)
+        assert (
+            h_state_diff < 1e-3
+        ), f"rank {rank} h_state_diff={h_state_diff:.6f} exceeds 1e-3"
+
+        # Compare v_new (DeltaV) first: zigzag-local segments vs reference slices.
+        v_diff = 0.0
+        local_offset, full_offset = 0, 0
+        for sl in seq_lengths:
+            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            dv0 = (
+                (
+                    v_z[:, local_offset : local_offset + half].float()
+                    - vn_ref[:, full_offset + s0 : full_offset + s0 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            dv1 = (
+                (
+                    v_z[:, local_offset + half : local_offset + 2 * half].float()
+                    - vn_ref[:, full_offset + s1 : full_offset + s1 + half].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            v_diff = max(v_diff, dv0, dv1)
+            local_offset += 2 * half
+            full_offset += sl
+
+        assert v_diff < 1e-3, f"rank {rank} v_diff={v_diff:.6f} exceeds 1e-3"
+        print(
+            f"################[input checking passed]: rank {rank} v_diff={v_diff:.6f}  h_state_diff={h_state_diff:.6f} "
         )
 
         # Compare
@@ -287,6 +388,19 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         local_offset, full_offset = 0, 0
         for sl in seq_lengths:
             s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            # cur_out_0 = o_z[:, local_offset : local_offset + half].float()
+            # ref_out_0 = o_ref[:, full_offset + s0 : full_offset + s0 + half].float()
+            # if not torch.allclose(ref_out_0, cur_out_0, rtol=0.01, atol=0.01):
+            #     # print(ref_out)
+            #     # print(cur_out)
+            #     # print(ref_out[0].tolist())
+            #     # print(cur_out[0].tolist())
+            #     idx = torch.where(torch.abs(ref_out_0 - cur_out_0) > 0.01)
+            #     if len(idx[0]):
+            #         print(
+            #             f"idx = {idx}\nref={ref_out_0[idx]}\ncur={cur_out_0[idx]}\n{len(idx[0])}"
+            #         )
+            #     # assert 0
             d0 = (
                 (
                     o_z[:, local_offset : local_offset + half].float()
@@ -306,6 +420,7 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
                 .item()
             )
             o_diff = max(o_diff, d0, d1)
+            print(f"  rank{rank} o_diff seg0={d0:.6f} seg1={d1:.6f}")
             local_offset += 2 * half
             full_offset += sl
 
@@ -374,7 +489,7 @@ if __name__ == "__main__":
         default=None,
         help="Sequence lengths (e.g. --seqlens 4096 8192)",
     )
-    parser.add_argument("--H", type=int, default=16)
+    parser.add_argument("--H", type=int, default=64)
     parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--V", type=int, default=128)
     args = parser.parse_args()
@@ -387,7 +502,10 @@ if __name__ == "__main__":
     # Default: run a suite of configs
     configs = [
         # [256],
-        [1024],
+        # [512],
+        # [1024],
+        [2048],
+        # [4096],
         # [8192],
         # [32768],
         # [4096, 4096],

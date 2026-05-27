@@ -558,7 +558,12 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
     # Reuse sglang's fused intra kernel (kkt + solve_tril + recompute_w_u)
     chunk_indices = prepare_chunk_indices(seg_cu, CHUNK_SIZE)
     w, u, A = chunk_gated_delta_rule_fwd_intra(
-        k=k, v=v, g=g, beta=beta, cu_seqlens=seg_cu, chunk_indices=chunk_indices,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=seg_cu,
+        chunk_indices=chunk_indices,
     )
 
     # Compute affine pairs (b, M) for each segment — [2*N, H, K, V] / [2*N, H, K, K]
@@ -644,4 +649,4 @@ def chunk_gated_delta_rule_fwd_cp_zigzag(
         else None
     )
 
-    return o, h_all, final_state
+    return o, h_all, final_state, v_new_all
