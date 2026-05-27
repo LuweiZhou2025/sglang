@@ -316,21 +316,22 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             )
 
         # Debug: compare h_all per chunk
-        # CP h_all has shape [1, 2*N_seq * NT_per_seg, H, V, K]
-        # For N=1, seg0 takes first NT_per_seg chunks of h_all, seg1 takes next NT_per_seg
-        NT_seg = h_all.shape[1] // 2
+        # CP h_all layout: [seq0_seg0, seq0_seg1, seq1_seg0, seq1_seg1, ...]
+        # where each entry has NT_seg_i = (sl_i // (2*cp_size)) // 64 chunks.
+        # Ref h_ref layout: [seq0_chunks, seq1_chunks, ...] with NT_i = sl_i//64 chunks.
         NT_chunk = 64
-        # seg0 of rank corresponds to full chunks at full positions [s0, s0+half)
-        # i.e., ref chunk indices [s0//64, (s0+half)//64)
         h_state_diff = 0.0
+        cp_h_offset = 0
+        ref_h_offset = 0
         for sl in seq_lengths:
             s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            ref_seg0_start = s0 // NT_chunk
-            ref_seg1_start = s1 // NT_chunk
+            nt_seg = half // NT_chunk  # chunks per half-segment for this seq
+            ref_seg0_start = ref_h_offset + s0 // NT_chunk
+            ref_seg1_start = ref_h_offset + s1 // NT_chunk
             diff_h0 = (
                 (
-                    h_all[0, :NT_seg].float()
-                    - h_ref[0, ref_seg0_start : ref_seg0_start + NT_seg].float()
+                    h_all[0, cp_h_offset : cp_h_offset + nt_seg].float()
+                    - h_ref[0, ref_seg0_start : ref_seg0_start + nt_seg].float()
                 )
                 .abs()
                 .max()
@@ -338,18 +339,20 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             )
             diff_h1 = (
                 (
-                    h_all[0, NT_seg:].float()
-                    - h_ref[0, ref_seg1_start : ref_seg1_start + NT_seg].float()
+                    h_all[0, cp_h_offset + nt_seg : cp_h_offset + 2 * nt_seg].float()
+                    - h_ref[0, ref_seg1_start : ref_seg1_start + nt_seg].float()
                 )
                 .abs()
                 .max()
                 .item()
             )
-            # print(f"  rank{rank} h_diff seg0={diff_h0:.6f} seg1={diff_h1:.6f}")
+            # print(f"  rank{rank} h_diff seq sl={sl} seg0={diff_h0:.6f} seg1={diff_h1:.6f}")
             h_state_diff = max(h_state_diff, diff_h0, diff_h1)
-        # assert (
-        #     h_state_diff < 1e-3
-        # ), f"rank {rank} h_state_diff={h_state_diff:.6f} exceeds 1e-3"
+            cp_h_offset += 2 * nt_seg
+            ref_h_offset += sl // NT_chunk
+        assert (
+            h_state_diff < 1e-3
+        ), f"rank {rank} h_state_diff={h_state_diff:.6f} exceeds 1e-3"
 
         # Compare v_new (DeltaV) first: zigzag-local segments vs reference slices.
         v_diff = 0.0
@@ -378,7 +381,7 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             local_offset += 2 * half
             full_offset += sl
 
-        # assert v_diff < 1e-3, f"rank {rank} v_diff={v_diff:.6f} exceeds 1e-3"
+        assert v_diff < 1e-3, f"rank {rank} v_diff={v_diff:.6f} exceeds 1e-3"
         print(
             f"################[input checking passed]: rank {rank} v_diff={v_diff:.6f}  h_state_diff={h_state_diff:.6f} "
         )
@@ -425,55 +428,6 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
         assert q_diff == 0.0, f"rank {rank} q_diff={q_diff} not bit-equal"
         assert k_diff == 0.0, f"rank {rank} k_diff={k_diff} not bit-equal"
         assert g_diff == 0.0, f"rank {rank} g_diff={g_diff} not bit-equal"
-
-        # ---- Probe: re-run chunk_fwd_o with CP-equivalent inputs externally ----
-        # Use v_z and h_all from CP (already verified bit-equal to ref slices).
-        # If this matches o_z → CP path is deterministic; the diff vs o_ref must be
-        # due to the kernel itself behaving differently for T=1024,seg_cu=[0,512,1024]
-        # vs T=2048,full_cu=[0,2048].
-        o_probe = chunk_fwd_o(
-            q=q_l,
-            k=k_l,
-            v=v_z,
-            h=h_all,
-            g=g_l_cumsum,
-            scale=scale,
-            cu_seqlens=seg_cu,
-        )
-        o_probe2 = chunk_fwd_o(
-            q=q_l,
-            k=k_l,
-            v=v_z,
-            h=h_all,
-            g=g_l_cumsum,
-            scale=scale,
-            cu_seqlens=seg_cu,
-        )
-        probe_vs_probe2 = (o_probe.float() - o_probe2.float()).abs().max().item()
-        probe_vs_oz = (o_probe.float() - o_z.float()).abs().max().item()
-        # Compare probe to ref at corresponding positions
-        probe_vs_ref = 0.0
-        local_offset, full_offset = 0, 0
-        for sl in seq_lengths:
-            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
-            for seg_idx, src_start in enumerate([s0, s1]):
-                lo = local_offset + seg_idx * half
-                fo = full_offset + src_start
-                probe_vs_ref = max(
-                    probe_vs_ref,
-                    (
-                        o_probe[:, lo : lo + half].float()
-                        - o_ref[:, fo : fo + half].float()
-                    )
-                    .abs()
-                    .max()
-                    .item(),
-                )
-            local_offset += 2 * half
-            full_offset += sl
-        print(
-            f"  rank{rank} probe_vs_probe2={probe_vs_probe2:.6e} probe_vs_oz={probe_vs_oz:.6e} probe_vs_ref={probe_vs_ref:.6e}"
-        )
 
         # Compare
         o_diff = 0.0
@@ -593,13 +547,13 @@ if __name__ == "__main__":
 
     # Default: run a suite of configs
     configs = [
-        # [256],
-        # [512],
-        # [1024],
-        # [2048],
-        # [4096],
-        # [8192],
-        # [32768],
+        [256],
+        [512],
+        [1024],
+        [2048],
+        [4096],
+        [8192],
+        [32768],
         [256, 256],
         [4096, 4096],
         [8192, 16384],
