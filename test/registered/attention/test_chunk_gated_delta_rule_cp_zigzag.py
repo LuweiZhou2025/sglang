@@ -383,6 +383,98 @@ def _worker(rank, world_size, nccl_port, seq_lengths, H, K, V):
             f"################[input checking passed]: rank {rank} v_diff={v_diff:.6f}  h_state_diff={h_state_diff:.6f} "
         )
 
+        # ---- Extra: verify q/k/g bit-equality at corresponding physical positions ----
+        # The CP function reassigns g via chunk_local_cumsum internally; replicate it here.
+        g_l_cumsum = chunk_local_cumsum(g_l.clone(), chunk_size=64, cu_seqlens=seg_cu)
+        q_diff = k_diff = g_diff = 0.0
+        local_offset, full_offset = 0, 0
+        for sl in seq_lengths:
+            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            for seg_idx, src_start in enumerate([s0, s1]):
+                lo = local_offset + seg_idx * half
+                fo = full_offset + src_start
+                q_diff = max(
+                    q_diff,
+                    (q_l[:, lo : lo + half].float() - q_full[:, fo : fo + half].float())
+                    .abs()
+                    .max()
+                    .item(),
+                )
+                k_diff = max(
+                    k_diff,
+                    (k_l[:, lo : lo + half].float() - k_full[:, fo : fo + half].float())
+                    .abs()
+                    .max()
+                    .item(),
+                )
+                g_diff = max(
+                    g_diff,
+                    (
+                        g_l_cumsum[:, lo : lo + half].float()
+                        - g_ref[:, fo : fo + half].float()
+                    )
+                    .abs()
+                    .max()
+                    .item(),
+                )
+            local_offset += 2 * half
+            full_offset += sl
+        print(
+            f"  rank{rank} q_diff={q_diff:.6e} k_diff={k_diff:.6e} g_diff(cumsumed)={g_diff:.6e}"
+        )
+        assert q_diff == 0.0, f"rank {rank} q_diff={q_diff} not bit-equal"
+        assert k_diff == 0.0, f"rank {rank} k_diff={k_diff} not bit-equal"
+        assert g_diff == 0.0, f"rank {rank} g_diff={g_diff} not bit-equal"
+
+        # ---- Probe: re-run chunk_fwd_o with CP-equivalent inputs externally ----
+        # Use v_z and h_all from CP (already verified bit-equal to ref slices).
+        # If this matches o_z → CP path is deterministic; the diff vs o_ref must be
+        # due to the kernel itself behaving differently for T=1024,seg_cu=[0,512,1024]
+        # vs T=2048,full_cu=[0,2048].
+        o_probe = chunk_fwd_o(
+            q=q_l,
+            k=k_l,
+            v=v_z,
+            h=h_all,
+            g=g_l_cumsum,
+            scale=scale,
+            cu_seqlens=seg_cu,
+        )
+        o_probe2 = chunk_fwd_o(
+            q=q_l,
+            k=k_l,
+            v=v_z,
+            h=h_all,
+            g=g_l_cumsum,
+            scale=scale,
+            cu_seqlens=seg_cu,
+        )
+        probe_vs_probe2 = (o_probe.float() - o_probe2.float()).abs().max().item()
+        probe_vs_oz = (o_probe.float() - o_z.float()).abs().max().item()
+        # Compare probe to ref at corresponding positions
+        probe_vs_ref = 0.0
+        local_offset, full_offset = 0, 0
+        for sl in seq_lengths:
+            s0, s1, half = _zigzag_seg_starts(sl, world_size, rank)
+            for seg_idx, src_start in enumerate([s0, s1]):
+                lo = local_offset + seg_idx * half
+                fo = full_offset + src_start
+                probe_vs_ref = max(
+                    probe_vs_ref,
+                    (
+                        o_probe[:, lo : lo + half].float()
+                        - o_ref[:, fo : fo + half].float()
+                    )
+                    .abs()
+                    .max()
+                    .item(),
+                )
+            local_offset += 2 * half
+            full_offset += sl
+        print(
+            f"  rank{rank} probe_vs_probe2={probe_vs_probe2:.6e} probe_vs_oz={probe_vs_oz:.6e} probe_vs_ref={probe_vs_ref:.6e}"
+        )
+
         # Compare
         o_diff = 0.0
         local_offset, full_offset = 0, 0
@@ -501,16 +593,16 @@ if __name__ == "__main__":
 
     # Default: run a suite of configs
     configs = [
-        # [256],
-        # [512],
-        # [1024],
+        [256],
+        [512],
+        [1024],
         [2048],
-        # [4096],
-        # [8192],
-        # [32768],
+        [4096],
+        [8192],
+        [32768],
         # [4096, 4096],
-        # [8192, 16384],
-        # [4096, 8192, 4096],
+        # # [8192, 16384],
+        # # [4096, 8192, 4096],
     ]
     results = []
     for sl in configs:
